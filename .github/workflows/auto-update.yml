@@ -1,0 +1,84 @@
+name: Auto update from upstream
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+    - cron: '0 3 1 * *' # monthly keepalive
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (workflow + state)
+        uses: actions/checkout@v4
+
+      - name: Monthly keepalive commit
+        if: github.event.schedule == '0 3 1 * *'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: monthly keepalive"
+          git push origin HEAD:main
+
+      - name: Resolve upstream commit
+        id: upstream
+        run: |
+          echo "sha=$(git ls-remote https://github.com/7Sageer/sublink-worker.git refs/heads/main | cut -f1)" >> "$GITHUB_OUTPUT"
+          echo "last=$(cat .last-deployed 2>/dev/null || echo none)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout upstream code
+        if: steps.upstream.outputs.sha != steps.upstream.outputs.last
+        uses: actions/checkout@v4
+        with:
+          repository: 7Sageer/sublink-worker
+          ref: ${{ steps.upstream.outputs.sha }}
+          path: app
+
+      - name: Setup Node
+        if: steps.upstream.outputs.sha != steps.upstream.outputs.last
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        if: steps.upstream.outputs.sha != steps.upstream.outputs.last
+        working-directory: app
+        run: npm ci --no-audit --no-fund
+
+      - name: Render production wrangler config
+        if: steps.upstream.outputs.sha != steps.upstream.outputs.last
+        run: node scripts/ci/render-prod-config.mjs app
+
+      - name: Deploy to Cloudflare
+        if: steps.upstream.outputs.sha != steps.upstream.outputs.last
+        working-directory: app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CI: 'true'
+          WRANGLER_SEND_METRICS: 'false'
+        run: npx wrangler deploy -c wrangler.prod.toml
+
+      - name: Smoke test live site
+        if: steps.upstream.outputs.sha != steps.upstream.outputs.last
+        run: node scripts/ci/smoke-test.mjs
+
+      - name: Record deployed commit
+        if: success() && steps.upstream.outputs.sha != steps.upstream.outputs.last
+        env:
+          SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          echo "$SHA" > .last-deployed
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .last-deployed
+          git commit -m "chore: deploy upstream ${SHA:0:7}"
+          git push origin HEAD:main
